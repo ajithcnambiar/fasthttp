@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net"
 	"os"
+	"runtime/trace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1799,6 +1800,15 @@ func nextConnID() uint64 {
 // See Server.MaxRequestBodySize for details.
 const DefaultMaxRequestBodySize = 4 * 1024 * 1024
 
+func (s *Server) getTrackingID(ctx *RequestCtx) string {
+	getargs := ctx.QueryArgs()
+	if getargs.Has("s") {
+		s := string(getargs.Peek("s"))
+		return s
+	}
+	return ""
+}
+
 func (s *Server) serveConn(c net.Conn) error {
 	defer atomic.AddInt32(&s.open, -1)
 
@@ -1942,6 +1952,16 @@ func (s *Server) serveConn(c net.Conn) error {
 		ctx.connID = connID
 		ctx.connRequestNum = connRequestNum
 		ctx.time = currentTime
+		trackingID := s.getTrackingID(ctx)
+		if len(trackingID) > 0 {
+			var err0 error
+			traceFile, err0 := os.Create("/tmp/traces/trace_" + trackingID)
+			if err0 == nil {
+				err0 = trace.Start(traceFile)
+				defer traceFile.Close()
+				defer trace.Stop()
+			}
+		}
 		s.Handler(ctx)
 
 		timeoutResponse = ctx.timeoutResponse
