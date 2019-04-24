@@ -1952,117 +1952,8 @@ func (s *Server) serveConn(c net.Conn) error {
 		ctx.connID = connID
 		ctx.connRequestNum = connRequestNum
 		ctx.time = currentTime
-		trackingID := s.getTrackingID(ctx)
-		if len(trackingID) > 0 {
-			var err0 error
-			traceFile, err0 := os.Create("/tmp/traces/trace_" + trackingID)
-			if err0 == nil {
-				err0 = trace.Start(traceFile)
-				defer traceFile.Close()
-				defer trace.Stop()
-			}
-		}
-		s.Handler(ctx)
 
-		timeoutResponse = ctx.timeoutResponse
-		if timeoutResponse != nil {
-			ctx = s.acquireCtx(c)
-			timeoutResponse.CopyTo(&ctx.Response)
-			if br != nil {
-				// Close connection, since br may be attached to the old ctx via ctx.fbr.
-				ctx.SetConnectionClose()
-			}
-		}
-
-		if !ctx.IsGet() && ctx.IsHead() {
-			ctx.Response.SkipBody = true
-		}
-		reqReset = true
-		ctx.Request.Reset()
-
-		hijackHandler = ctx.hijackHandler
-		ctx.hijackHandler = nil
-
-		ctx.userValues.Reset()
-
-		if s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn) {
-			ctx.SetConnectionClose()
-		}
-
-		if s.WriteTimeout > 0 || s.MaxKeepaliveDuration > 0 {
-			lastWriteDeadlineTime = s.updateWriteDeadline(c, ctx, lastWriteDeadlineTime)
-		}
-
-		connectionClose = connectionClose || ctx.Response.ConnectionClose()
-		if connectionClose {
-			ctx.Response.Header.SetCanonical(strConnection, strClose)
-		} else if !isHTTP11 {
-			// Set 'Connection: keep-alive' response header for non-HTTP/1.1 request.
-			// There is no need in setting this header for http/1.1, since in http/1.1
-			// connections are keep-alive by default.
-			ctx.Response.Header.SetCanonical(strConnection, strKeepAlive)
-		}
-
-		if serverName != nil && len(ctx.Response.Header.Server()) == 0 {
-			ctx.Response.Header.SetServerBytes(serverName)
-		}
-
-		if bw == nil {
-			bw = acquireWriter(ctx)
-		}
-		if err = writeResponse(ctx, bw); err != nil {
-			break
-		}
-
-		// Only flush the writer if we don't have another request in the pipeline.
-		// This is a big of an ugly optimization for https://www.techempower.com/benchmarks/
-		// This benchmark will send 16 pipelined requests. It is faster to pack as many responses
-		// in a TCP packet and send it back at once than waiting for a flush every request.
-		// In real world circumstances this behaviour could be argued as being wrong.
-		if br == nil || br.Buffered() == 0 || connectionClose {
-			err = bw.Flush()
-			if err != nil {
-				break
-			}
-		}
-		if connectionClose {
-			break
-		}
-		if s.ReduceMemoryUsage {
-			releaseWriter(s, bw)
-			bw = nil
-		}
-
-		if hijackHandler != nil {
-			var hjr io.Reader = c
-			if br != nil {
-				hjr = br
-				br = nil
-
-				// br may point to ctx.fbr, so do not return ctx into pool.
-				ctx = s.acquireCtx(c)
-			}
-			if bw != nil {
-				err = bw.Flush()
-				if err != nil {
-					break
-				}
-				releaseWriter(s, bw)
-				bw = nil
-			}
-			c.SetReadDeadline(zeroTime)
-			c.SetWriteDeadline(zeroTime)
-			go hijackConnHandler(hjr, c, s, hijackHandler)
-			hijackHandler = nil
-			err = errHijacked
-			break
-		}
-
-		currentTime = time.Now()
-		s.setState(c, StateIdle)
-
-		if atomic.LoadInt32(&s.stop) == 1 {
-			err = nil
+		if !s.do(br, bw, &err, timeoutResponse, hijackHandler, &lastWriteDeadlineTime, &connectionClose, &isHTTP11, &reqReset, &connRequestNum, ctx, &currentTime, &c, &serverName) {
 			break
 		}
 	}
@@ -2081,6 +1972,122 @@ func (s *Server) serveConn(c net.Conn) error {
 	}
 	s.releaseCtx(ctx)
 	return err
+}
+
+func (s *Server) do(br *bufio.Reader, bw *bufio.Writer, err *error, timeoutResponse *Response, hijackHandler HijackHandler, lastWriteDeadlineTime *time.Time, connectionClose *bool, isHTTP11 *bool, reqReset *bool, connRequestNum *uint64, ctx *RequestCtx, currentTime *time.Time, c *net.Conn, serverName *[]byte) bool {
+	trackingID := s.getTrackingID(ctx)
+	if len(trackingID) > 0 {
+		traceFile, err0 := os.Create("/tmp/traces/trace_" + trackingID)
+		if err0 == nil {
+			err0 = trace.Start(traceFile)
+			defer traceFile.Close()
+			defer trace.Stop()
+		}
+	}
+	s.Handler(ctx)
+
+	timeoutResponse = ctx.timeoutResponse
+	if timeoutResponse != nil {
+		ctx = s.acquireCtx(*c)
+		timeoutResponse.CopyTo(&ctx.Response)
+		if br != nil {
+			// Close connection, since br may be attached to the old ctx via ctx.fbr.
+			ctx.SetConnectionClose()
+		}
+	}
+
+	if !ctx.IsGet() && ctx.IsHead() {
+		ctx.Response.SkipBody = true
+	}
+	*reqReset = true
+	ctx.Request.Reset()
+
+	hijackHandler = ctx.hijackHandler
+	ctx.hijackHandler = nil
+
+	ctx.userValues.Reset()
+
+	if s.MaxRequestsPerConn > 0 && *connRequestNum >= uint64(s.MaxRequestsPerConn) {
+		ctx.SetConnectionClose()
+	}
+
+	if s.WriteTimeout > 0 || s.MaxKeepaliveDuration > 0 {
+		*lastWriteDeadlineTime = s.updateWriteDeadline(*c, ctx, *lastWriteDeadlineTime)
+	}
+
+	*connectionClose = *connectionClose || ctx.Response.ConnectionClose()
+	if *connectionClose {
+		ctx.Response.Header.SetCanonical(strConnection, strClose)
+	} else if !(*isHTTP11) {
+		// Set 'Connection: keep-alive' response header for non-HTTP/1.1 request.
+		// There is no need in setting this header for http/1.1, since in http/1.1
+		// connections are keep-alive by default.
+		ctx.Response.Header.SetCanonical(strConnection, strKeepAlive)
+	}
+
+	if serverName != nil && len(ctx.Response.Header.Server()) == 0 {
+		ctx.Response.Header.SetServerBytes(*serverName)
+	}
+
+	if bw == nil {
+		bw = acquireWriter(ctx)
+	}
+	if (*err) = writeResponse(ctx, bw); (*err) != nil {
+		return false
+	}
+
+	// Only flush the writer if we don't have another request in the pipeline.
+	// This is a big of an ugly optimization for https://www.techempower.com/benchmarks/
+	// This benchmark will send 16 pipelined requests. It is faster to pack as many responses
+	// in a TCP packet and send it back at once than waiting for a flush every request.
+	// In real world circumstances this behaviour could be argued as being wrong.
+	if br == nil || br.Buffered() == 0 || *connectionClose {
+		(*err) = bw.Flush()
+		if (*err) != nil {
+			return false
+		}
+	}
+	if *connectionClose {
+		return false
+	}
+	if s.ReduceMemoryUsage {
+		releaseWriter(s, bw)
+		bw = nil
+	}
+
+	if hijackHandler != nil {
+		var hjr io.Reader = *c
+		if br != nil {
+			hjr = br
+			br = nil
+
+			// br may point to ctx.fbr, so do not return ctx into pool.
+			ctx = s.acquireCtx(*c)
+		}
+		if bw != nil {
+			(*err) = bw.Flush()
+			if (*err) != nil {
+				return false
+			}
+			releaseWriter(s, bw)
+			bw = nil
+		}
+		(*c).SetReadDeadline(zeroTime)
+		(*c).SetWriteDeadline(zeroTime)
+		go hijackConnHandler(hjr, *c, s, hijackHandler)
+		hijackHandler = nil
+		*err = errHijacked
+		return false
+	}
+
+	*currentTime = time.Now()
+	s.setState(*c, StateIdle)
+
+	if atomic.LoadInt32(&s.stop) == 1 {
+		*err = nil
+		return false
+	}
+	return true
 }
 
 func (s *Server) setState(nc net.Conn, state ConnState) {
